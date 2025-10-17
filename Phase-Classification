@@ -1,0 +1,416 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib import patheffects as pe
+from functools import reduce
+from sklearn.svm import SVC
+import pennylane as qml
+from scipy.sparse import kron, identity, csr_matrix
+from scipy.sparse.linalg import eigsh
+import warnings
+
+warnings.filterwarnings("ignore")
+
+FONTSIZE_LABEL = 12
+FONTSIZE_TICKS = 10
+FONTSIZE_LEGEND = 10
+LINEWIDTH_MAIN = 2.4
+LINEWIDTH_GRID = 0.55
+LINEWIDTH_BOX = 2.0
+MARKERSIZE = 5.6
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "axes.labelsize": FONTSIZE_LABEL,
+    "axes.labelweight": "bold",
+    "xtick.labelsize": FONTSIZE_TICKS,
+    "ytick.labelsize": FONTSIZE_TICKS,
+    "legend.fontsize": FONTSIZE_LEGEND,
+    "axes.linewidth": 2.2,
+    "xtick.major.width": 2.2,
+    "xtick.major.size": 6.0,
+    "ytick.major.width": 2.2,
+    "ytick.major.size": 6.0,
+    "figure.dpi": 200,
+    "savefig.dpi": 600
+})
+
+C_ANALYTIC = "#1f5cab"
+C_ED = "#e6a700"
+C_SWAP = "#cc2936"
+CMAP_F = "viridis"
+CMAP_L = "cividis"
+
+def k_modes(N):
+    if N % 2:
+        raise ValueError("Use even N.")
+    return (2 * np.arange(N // 2) + 1) * np.pi / N
+
+def theta_k(h, gamma, ks, N=None, gamma_floor=None, eta=0.0):
+    if N is None:
+        N = 2 * len(ks)
+    if gamma_floor is None:
+        gamma_floor = 0.5 * np.pi / float(N)
+    geff = np.sign(gamma) * max(abs(gamma), float(gamma_floor))
+    denom = (h - np.cos(ks)) + float(eta)
+    return 0.5 * np.arctan2(geff * np.sin(ks), denom)
+
+def fidelity_xy(h1, h2, gamma, N, ks=None, gamma_floor=None, eta=0.0):
+    ks = k_modes(N) if ks is None else ks
+    t1 = theta_k(h1, gamma, ks, N=N, gamma_floor=gamma_floor, eta=eta)
+    t2 = theta_k(h2, gamma, ks, N=N, gamma_floor=gamma_floor, eta=eta)
+    dth = t2 - t1
+    c = np.clip(np.abs(np.cos(dth)), 1e-300, 1.0)
+    return float(np.exp(np.sum(np.log(c))))
+
+def build_K_F_analytic(h_list, gamma, N, gamma_floor=None, eta=0.0):
+    ks = k_modes(N)
+    h = np.asarray(h_list)
+    M = len(h)
+    K = np.eye(M, dtype=float)
+    for i in range(M):
+        for j in range(i + 1, M):
+            K[i, j] = K[j, i] = fidelity_xy(h[i], h[j], gamma, N, ks, gamma_floor=gamma_floor, eta=eta)
+    return K
+
+def cross_K_F_analytic(hA, hB, gamma, N, gamma_floor=None, eta=0.0):
+    ks = k_modes(N)
+    KA, KB = len(hA), len(hB)
+    K = np.empty((KA, KB), float)
+    for i in range(KA):
+        for j in range(KB):
+            K[i, j] = fidelity_xy(hA[i], hB[j], gamma, N, ks, gamma_floor=gamma_floor, eta=eta)
+    return K
+
+paulis = {
+    "X": csr_matrix([[0, 1], [1, 0]], dtype=complex),
+    "Y": csr_matrix([[0, -1j], [1j, 0]], dtype=complex),
+    "Z": csr_matrix([[1, 0], [0, -1]], dtype=complex),
+    "I": identity(2, format="csr")
+}
+
+def term_sparse(N, ops):
+    mats = [paulis.get(ops.get(i, "I"), paulis["I"]) for i in range(N)]
+    return reduce(lambda A, B: kron(A, B, format="csr"), mats)
+
+def build_static_hamiltonians_XY(N, gamma, tol=1e-14):
+    D = 1 << N
+    H_int = csr_matrix((D, D), dtype=complex)
+    H_field = csr_matrix((D, D), dtype=complex)
+    for i in range(N):
+        ip1 = (i + 1) % N
+        c_xx = (1 + gamma) / 2
+        c_yy = (1 - gamma) / 2
+        if abs(c_xx) > tol:
+            H_int -= c_xx * term_sparse(N, {i: "X", ip1: "X"})
+        if abs(c_yy) > tol:
+            H_int -= c_yy * term_sparse(N, {i: "Y", ip1: "Y"})
+        H_field -= term_sparse(N, {i: "Z"})
+    return H_int, H_field
+
+def parity_basis_indices(N, want_even=True):
+    return np.array([s for s in range(1 << N) if ((bin(s).count("1") & 1) == 0) == want_even], dtype=int)
+
+def restrict_block(H, idx):
+    return H[idx, :][:, idx]
+
+def ground_state_eigsh(H, v0=None, tol=1e-10, maxiter=None):
+    w, V = eigsh(H, k=1, which="SA", v0=v0, tol=tol, maxiter=maxiter)
+    psi = V[:, 0]
+    psi /= np.linalg.norm(psi)
+    return psi
+
+def compute_states_ED(h_vals, N_ED, gamma, parity="even"):
+    D_full = 1 << N_ED
+    idx = parity_basis_indices(N_ED, want_even=(parity == "even"))
+    H_int_full, H_field_full = build_static_hamiltonians_XY(N_ED, gamma)
+    H_int = restrict_block(H_int_full, idx)
+    H_field = restrict_block(H_field_full, idx)
+    states_full = {}
+    v0 = None
+    for h in np.sort(np.unique(h_vals)):
+        H = H_int + h * H_field
+        psi_block = ground_state_eigsh(H, v0=v0, tol=1e-10, maxiter=None)
+        psi_full = np.zeros(D_full, dtype=complex)
+        psi_full[idx] = psi_block
+        psi_full /= np.linalg.norm(psi_full) + 1e-300
+        states_full[float(h)] = psi_full
+        v0 = psi_block
+    return states_full
+
+def kernel_from_states_ED(h_list, states, N_ED, per_site=False, N_sys=None):
+    N_exp = N_sys if (per_site and N_sys is not None) else N_ED
+    h = np.asarray(h_list)
+    M = len(h)
+    K = np.eye(M, dtype=float)
+    for i in range(M):
+        psi_i = states[float(h[i])]
+        for j in range(i + 1, M):
+            psi_j = states[float(h[j])]
+            Fij = float(np.abs(np.vdot(psi_i, psi_j)))
+            K[i, j] = K[j, i] = Fij ** (1.0 / N_exp) if per_site else Fij
+    return K
+
+def cross_kernel_from_states_ED(hA, hB, states, N_ED, per_site=False, N_sys=None):
+    N_exp = N_sys if (per_site and N_sys is not None) else N_ED
+    KA, KB = len(hA), len(hB)
+    K = np.empty((KA, KB), float)
+    for i in range(KA):
+        psi_i = states[float(hA[i])]
+        for j in range(KB):
+            psi_j = states[float(hB[j])]
+            Fij = float(np.abs(np.vdot(psi_i, psi_j)))
+            K[i, j] = Fij ** (1.0 / N_exp) if per_site else Fij
+    return K
+
+def make_true_swap_qnode(N_sys, shots=2000, seed=123):
+    try:
+        dev = qml.device("lightning.qubit", wires=1 + 2 * N_sys, shots=shots, seed=seed)
+    except TypeError:
+        dev = qml.device("lightning.qubit", wires=1 + 2 * N_sys, shots=shots)
+    anc = 0
+    regA = list(range(1, 1 + N_sys))
+    regB = list(range(1 + N_sys, 1 + 2 * N_sys))
+    @qml.qnode(dev, interface="numpy")
+    def qnode(state_a, state_b):
+        qml.StatePrep(state_a, wires=regA)
+        qml.StatePrep(state_b, wires=regB)
+        qml.Hadamard(anc)
+        for i in range(N_sys):
+            qml.CSWAP([anc, regA[i], regB[i]])
+        qml.Hadamard(anc)
+        return qml.expval(qml.PauliZ(anc))
+    return qnode
+
+def fidelity_from_swap_ED(h1, h2, states, qnode):
+    psi_a = states[float(h1)]
+    psi_b = states[float(h2)]
+    z = float(qnode(psi_a, psi_b))
+    return float(np.sqrt(np.clip(z, 0.0, 1.0)))
+
+def build_K_F_swap_ED(h_list, states, N_ED, shots=2000, seed=123):
+    h = np.asarray(h_list)
+    M = len(h)
+    K = np.eye(M, dtype=float)
+    qnode = make_true_swap_qnode(N_ED, shots=shots, seed=seed)
+    for i in range(M):
+        for j in range(i + 1, M):
+            Fij = fidelity_from_swap_ED(h[i], h[j], states, qnode)
+            K[i, j] = K[j, i] = Fij
+    return K
+
+def cross_K_F_swap_ED(hA, hB, states, N_ED, shots=2000, seed=123):
+    hA, hB = np.asarray(hA), np.asarray(hB)
+    KA, KB = len(hA), len(hB)
+    K = np.empty((KA, KB), float)
+    qnode = make_true_swap_qnode(N_ED, shots=shots, seed=seed)
+    for i in range(KA):
+        for j in range(KB):
+            K[i, j] = fidelity_from_swap_ED(hA[i], hB[j], states, qnode)
+    return K
+
+def center_train_kernel(K):
+    r = K.mean(axis=1, keepdims=True)
+    c = K.mean(axis=0, keepdims=True)
+    a = K.mean()
+    return K - r - c + a, r.ravel(), c.ravel(), float(a)
+
+def center_cross_kernel(Kx, r_train, c_train, a_mean):
+    mean_star = Kx.mean(axis=1, keepdims=True)
+    return Kx - mean_star - c_train.reshape(1, -1) + a_mean
+
+def svm_decision_precomputed(K_train, y_train, K_cross, C=1.0, center=True):
+    if center:
+        Kc, rmean, cmean, amean = center_train_kernel(K_train)
+        Kx = center_cross_kernel(K_cross, rmean, cmean, amean)
+    else:
+        Kc, Kx = K_train, K_cross
+    clf = SVC(kernel="precomputed", C=C)
+    clf.fit(Kc, y_train)
+    return clf.decision_function(Kx)
+
+def scale_decision(d, mode="tanh"):
+    if mode == "raw":
+        return d
+    if mode == "tanh":
+        return np.tanh(d)
+    if mode == "p99":
+        s = np.percentile(np.abs(d), 99) + 1e-12
+        return np.clip(d / s, -1, 1)
+    if mode == "z":
+        m, s = d.mean(), d.std() + 1e-12
+        return np.clip((d - m) / s, -3, 3)
+    return d
+
+def beautify_axes(ax, show_minor=True):
+    ax.grid(True, which="major", alpha=0.22, lw=LINEWIDTH_GRID)
+    if show_minor:
+        ax.minorticks_on()
+        ax.grid(True, which="minor", alpha=0.08, lw=LINEWIDTH_GRID * 0.8)
+    for s in ("top", "right", "bottom", "left"):
+        ax.spines[s].set_visible(False)
+
+def box_axes(ax, inset=0.006, lw=LINEWIDTH_BOX, zorder=-1):
+    rect = Rectangle((inset, inset), 1 - 2 * inset, 1 - 2 * inset, transform=ax.transAxes, fill=False, edgecolor="black", linewidth=lw, zorder=zorder, clip_on=False)
+    ax.add_patch(rect)
+
+def run_pra_doublecolumn_PL(
+    N=12,
+    gamma=0.05,
+    gamma_floor=1e-3,
+    eta=1e-4,
+    N_ED=12,
+    parity="even",
+    h_train_left=(0.6, 0.95),
+    h_train_right=(1.05, 1.4),
+    n_train_each=8,
+    h_test_min=0.6,
+    h_test_max=1.4,
+    n_test=401,
+    C=1e6,
+    center_kernels=True,
+    use_swap_test=True,
+    swap_shots=2000,
+    swap_seed=123,
+    make_heatmaps=True,
+    n_map=121,
+    ed_marker_spacing=12,
+    scale_mode="tanh",
+    save_pdf=True,
+    save_png=False,
+    fname="PRA_doublecolumn_PL"
+):
+    print(f"[RUN] N={N}, N_ED={N_ED}, γ={gamma} | use_swap_test={use_swap_test} (shots={swap_shots})")
+    h_test = np.linspace(h_test_min, h_test_max, n_test)
+    hL = np.linspace(*h_train_left, n_train_each)
+    hR = np.linspace(*h_train_right, n_train_each)
+    h_train = np.concatenate([hL, hR])
+    y_train = np.array([-1] * n_train_each + [1] * n_train_each)
+    h_all = np.unique(np.concatenate([h_train, h_test]))
+    if make_heatmaps:
+        h_map = np.linspace(h_test_min, h_test_max, n_map)
+        h_all = np.unique(np.concatenate([h_all, h_map]))
+    states_ED = compute_states_ED(h_all, N_ED=N_ED, gamma=gamma, parity=parity)
+    Ktr_F_an = build_K_F_analytic(h_train, gamma, N, gamma_floor=gamma_floor, eta=eta)
+    Kxr_F_an = cross_K_F_analytic(h_test, h_train, gamma, N, gamma_floor=gamma_floor, eta=eta)
+    dF_an = svm_decision_precomputed(Ktr_F_an, y_train, Kxr_F_an, C=C, center=center_kernels)
+    Ktr_F_ed = kernel_from_states_ED(h_train, states_ED, N_ED, per_site=False)
+    Kxr_F_ed = cross_kernel_from_states_ED(h_test, h_train, states_ED, N_ED, per_site=False)
+    dF_ed = svm_decision_precomputed(Ktr_F_ed, y_train, Kxr_F_ed, C=C, center=center_kernels)
+    if use_swap_test:
+        Ktr_F_sw = build_K_F_swap_ED(h_train, states_ED, N_ED, shots=swap_shots, seed=swap_seed)
+        Kxr_F_sw = cross_K_F_swap_ED(h_test, h_train, states_ED, N_ED, shots=swap_shots, seed=swap_seed)
+        dF_sw = svm_decision_precomputed(Ktr_F_sw, y_train, Kxr_F_sw, C=C, center=center_kernels)
+    else:
+        dF_sw = None
+    Ktr_L_an = np.power(np.clip(Ktr_F_an, 1e-300, 1.0), 1.0 / N)
+    Kxr_L_an = np.power(np.clip(Kxr_F_an, 1e-300, 1.0), 1.0 / N)
+    dL_an = svm_decision_precomputed(Ktr_L_an, y_train, Kxr_L_an, C=C, center=center_kernels)
+    Ktr_L_ed = kernel_from_states_ED(h_train, states_ED, N_ED, per_site=True, N_sys=N)
+    Kxr_L_ed = cross_kernel_from_states_ED(h_test, h_train, states_ED, N_ED, per_site=True, N_sys=N)
+    dL_ed = svm_decision_precomputed(Ktr_L_ed, y_train, Kxr_L_ed, C=C, center=center_kernels)
+    if use_swap_test:
+        Ktr_L_sw = np.power(np.clip(Ktr_F_sw, 1e-300, 1.0), 1.0 / N)
+        Kxr_L_sw = np.power(np.clip(Kxr_F_sw, 1e-300, 1.0), 1.0 / N)
+        dL_sw = svm_decision_precomputed(Ktr_L_sw, y_train, Kxr_L_sw, C=C, center=center_kernels)
+    else:
+        dL_sw = None
+    dF_p, dF_ed_p = map(lambda x: scale_decision(x, scale_mode), [dF_an, dF_ed])
+    dL_p, dL_ed_p = map(lambda x: scale_decision(x, scale_mode), [dL_an, dL_ed])
+    if use_swap_test:
+        dF_sw_p = scale_decision(dF_sw, scale_mode)
+        dL_sw_p = scale_decision(dL_sw, scale_mode)
+    if make_heatmaps:
+        K_map_F = build_K_F_analytic(h_map, gamma, N, gamma_floor=gamma_floor, eta=eta)
+        K_map_L = np.power(np.clip(K_map_F, 1e-300, 1.0), 1.0 / N)
+        vmin_F, vmax_F = 0.0, 1.0
+        finite_vals = K_map_L[np.isfinite(K_map_L)]
+        base_p = 2.0 if np.nanmax(finite_vals) > 0.995 else 5.0
+        vmin_L = float(np.percentile(finite_vals, base_p))
+        vmax_L = 1.0
+    fig = plt.figure(figsize=(7.2, 5.0))
+    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.32)
+    ed_idx = np.arange(0, len(h_test), ed_marker_spacing)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(h_test, dF_p, "-", color=C_ANALYTIC, path_effects=[pe.withStroke(linewidth=LINEWIDTH_MAIN + 1.0, foreground="white", alpha=0.6)], label="Analytic")
+    ax1.plot(h_test[ed_idx], dF_ed_p[ed_idx], "o", ms=MARKERSIZE, mfc=C_ED, mec="black", mew=0.9, linestyle="None", label="ED")
+    if use_swap_test:
+        ax1.plot(h_test, dF_sw_p, "--", color=C_SWAP, lw=LINEWIDTH_MAIN, dashes=(8, 4), label="SWAP (true)")
+    ax1.axhline(0, color="k", lw=1.1, alpha=0.8)
+    ax1.axvline(1.0, color="k", lw=1.1, ls=":", alpha=0.9)
+    ax1.set_xlim(h_test_min, h_test_max)
+    ax1.set_ylabel("d(h)", fontweight="bold")
+    ax1.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+    beautify_axes(ax1)
+    box_axes(ax1)
+    ax1.legend(loc="lower right", frameon=True, framealpha=0.95, edgecolor="black", handlelength=1.6, labelspacing=0.3, borderpad=0.35)
+    ax2 = fig.add_subplot(gs[0, 1])
+    if make_heatmaps:
+        im2 = ax2.imshow(K_map_F, origin="lower", extent=(h_map[0], h_map[-1], h_map[0], h_map[-1]), aspect="auto", cmap=CMAP_F, vmin=vmin_F, vmax=vmax_F, interpolation="bilinear")
+        cs2 = ax2.contour(h_map, h_map, K_map_F, levels=8, colors="white", linewidths=0.55, alpha=0.7)
+        ax2.clabel(cs2, inline=True, fmt="%.2f", fontsize=7, colors="white")
+        ax2.set_ylabel("h'", fontweight="bold")
+        ax2.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+        beautify_axes(ax2, show_minor=False)
+        box_axes(ax2)
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        cbar2.set_label(r"$K^{(F)}$", rotation=90, fontweight="bold")
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(h_test, dL_p, "-", color=C_ANALYTIC, path_effects=[pe.withStroke(linewidth=LINEWIDTH_MAIN + 1.0, foreground="white", alpha=0.6)], label="Analytic")
+    ax3.plot(h_test[ed_idx], dL_ed_p[ed_idx], "o", ms=MARKERSIZE, mfc=C_ED, mec="black", mew=0.9, linestyle="None", label="ED")
+    if use_swap_test:
+        ax3.plot(h_test, dL_sw_p, "--", color=C_SWAP, lw=LINEWIDTH_MAIN, dashes=(8, 4), label="SWAP (true)")
+    ax3.axhline(0, color="k", lw=1.1, alpha=0.8)
+    ax3.axvline(1.0, color="k", lw=1.1, ls=":", alpha=0.9)
+    ax3.set_xlim(h_test_min, h_test_max)
+    ax3.set_ylabel("d(h)", fontweight="bold")
+    ax3.set_xlabel("h", fontweight="bold")
+    beautify_axes(ax3)
+    box_axes(ax3)
+    ax3.legend(loc="lower right", frameon=True, framealpha=0.95, edgecolor="black", handlelength=1.6, labelspacing=0.3, borderpad=0.35)
+    ax4 = fig.add_subplot(gs[1, 1])
+    if make_heatmaps:
+        im4 = ax4.imshow(K_map_L, origin="lower", extent=(h_map[0], h_map[-1], h_map[0], h_map[-1]), aspect="auto", cmap=CMAP_L, vmin=vmin_L, vmax=vmax_L, interpolation="bilinear")
+        cs4 = ax4.contour(h_map, h_map, K_map_L, levels=6, colors="white", linewidths=0.55, alpha=0.7)
+        ax4.clabel(cs4, inline=True, fmt="%.3f", fontsize=7, colors="white")
+        ax4.set_xlabel("h", fontweight="bold")
+        ax4.set_ylabel("h'", fontweight="bold")
+        beautify_axes(ax4, show_minor=False)
+        box_axes(ax4)
+        cbar4 = plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+        cbar4.set_label(r"$K^{(\lambda)}$", rotation=90, fontweight="bold")
+    if save_pdf:
+        fig.savefig(f"{fname}.pdf", bbox_inches="tight")
+        print(f" Saved {fname}.pdf")
+    if save_png:
+        fig.savefig(f"{fname}.png", bbox_inches="tight")
+        print(f" Saved {fname}.png")
+    plt.show()
+
+if __name__ == "__main__":
+    run_pra_doublecolumn_PL(
+        N=12,
+        gamma=0.09,
+        gamma_floor=1e-3,
+        eta=1e-4,
+        N_ED=12,
+        parity="even",
+        h_train_left=(0.6, 0.98),
+        h_train_right=(1.03, 1.4),
+        n_train_each=8,
+        h_test_min=0.5,
+        h_test_max=1.5,
+        n_test=401,
+        C=1e2,
+        center_kernels=False,
+        use_swap_test=False,
+        swap_shots=None,
+        make_heatmaps=True,
+        n_map=121,
+        ed_marker_spacing=12,
+        scale_mode="tanh",
+        save_pdf=True,
+        save_png=False,
+        fname="try_true_swap"
+    )

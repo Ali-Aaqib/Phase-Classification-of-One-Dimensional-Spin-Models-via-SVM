@@ -1,0 +1,298 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from scipy.sparse import csr_matrix, kron, eye
+from scipy.sparse.linalg import eigsh
+from sklearn.svm import SVC
+import pennylane as qml
+import warnings
+warnings.filterwarnings('ignore')
+
+FONTSIZE_LABEL  = 12
+FONTSIZE_TICKS  = 10
+FONTSIZE_LEGEND = 10
+LINEWIDTH_MAIN  = 2.4
+LINEWIDTH_GRID  = 0.55
+LINEWIDTH_BOX   = 2.0
+MARKERSIZE      = 5.6
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "axes.labelsize": FONTSIZE_LABEL,
+    "axes.labelweight": "bold",
+    "xtick.labelsize": FONTSIZE_TICKS,
+    "ytick.labelsize": FONTSIZE_TICKS,
+    "legend.fontsize": FONTSIZE_LEGEND,
+    "axes.linewidth": 2.2,
+    "xtick.major.width": 2.2,
+    "xtick.major.size": 6.0,
+    "ytick.major.width": 2.2,
+    "ytick.major.size": 6.0,
+    "figure.dpi": 200,
+    "savefig.dpi": 600,
+})
+
+C_ED   = "#e6a700"
+C_SWAP = "#cc2936"
+CMAP_F = "viridis"
+CMAP_L = "cividis"
+
+pauli_X = csr_matrix(np.array([[0, 1], [1, 0]], dtype=complex))
+pauli_Y = csr_matrix(np.array([[0, -1j], [1j, 0]], dtype=complex))
+pauli_Z = csr_matrix(np.array([[1, 0], [0, -1]], dtype=complex))
+pauli_I = eye(2, dtype=complex, format='csr')
+
+def two_site_block(N, i, O2, I):
+    j = (i % N) + 1
+    out = None
+    s = 1
+    while s <= N:
+        if s == i:
+            block = O2
+            s += 2
+        elif s == j:
+            s += 1
+            continue
+        else:
+            block = I
+            s += 1
+        out = block if out is None else kron(out, block, format='csr')
+    return out
+
+def build_blocks_xxz_your_norm(N):
+    XX = kron(pauli_X, pauli_X, format='csr')
+    YY = kron(pauli_Y, pauli_Y, format='csr')
+    ZZ = kron(pauli_Z, pauli_Z, format='csr')
+    dim = 2**N
+    H_XY = csr_matrix((dim, dim), dtype=complex)
+    H_ZZ = csr_matrix((dim, dim), dtype=complex)
+    for i in range(1, N + 1):
+        H_XY = H_XY + (-0.5) * two_site_block(N, i, XX, pauli_I)
+        H_XY = H_XY + (-0.5) * two_site_block(N, i, YY, pauli_I)
+        H_ZZ = H_ZZ + (-1.0) * two_site_block(N, i, ZZ, pauli_I)
+    return H_XY, H_ZZ
+
+def ground_state(H, v0=None, tol=1e-10):
+    vals, vecs = eigsh(H, k=1, which='SA', tol=tol, maxiter=2000, v0=v0)
+    psi = vecs[:, 0]
+    psi /= np.linalg.norm(psi) + 1e-300
+    return vals[0], psi
+
+def make_xxz_data(N=6, deltas=None):
+    if deltas is None:
+        deltas = np.linspace(0.2, 0.8, 21)
+    H_XY, H_ZZ = build_blocks_xxz_your_norm(N)
+    states = {}
+    psi_prev = None
+    unique_deltas = np.unique(np.sort(deltas))
+    for delta in unique_deltas:
+        H = H_XY + delta * H_ZZ
+        _, psi = ground_state(H, v0=psi_prev, tol=1e-10)
+        states[float(delta)] = psi
+        psi_prev = psi
+    return {'N': N, 'deltas': unique_deltas, 'H_XY': H_XY, 'H_ZZ': H_ZZ, 'states': states}
+
+def make_true_swap_qnode(N_sys, shots=None, seed=123):
+    if shots is None:
+        dev = qml.device("lightning.qubit", wires=1 + 2*N_sys)
+    else:
+        try:
+            dev = qml.device("lightning.qubit", wires=1 + 2*N_sys, shots=shots, seed=seed)
+        except TypeError:
+            dev = qml.device("lightning.qubit", wires=1 + 2*N_sys, shots=shots)
+    anc = 0
+    regA = list(range(1, 1 + N_sys))
+    regB = list(range(1 + N_sys, 1 + 2*N_sys))
+    @qml.qnode(dev, interface="numpy")
+    def qnode(state_a, state_b):
+        qml.StatePrep(state_a, wires=regA)
+        qml.StatePrep(state_b, wires=regB)
+        qml.Hadamard(anc)
+        for i in range(N_sys):
+            qml.CSWAP([anc, regA[i], regB[i]])
+        qml.Hadamard(anc)
+        return qml.expval(qml.PauliZ(anc))  # equals |<ψ|φ>|^2
+    return qnode
+
+def fidelity_direct_overlap(psi1, psi2):
+    return float(np.abs(np.vdot(psi1, psi2))**2)
+
+def kernel_fidelity_direct(data, Xd, Yd):
+    K = np.zeros((len(Xd), len(Yd)))
+    for i, a in enumerate(Xd):
+        psi_a = data['states'][float(a)]
+        for j, b in enumerate(Yd):
+            psi_b = data['states'][float(b)]
+            K[i, j] = fidelity_direct_overlap(psi_a, psi_b)
+    return K
+
+def kernel_per_site_direct(data, Xd, Yd, eps=1e-300):
+    F = kernel_fidelity_direct(data, Xd, Yd)
+    F = np.clip(F, eps, 1.0)
+    return F**(1.0 / data['N'])
+
+def kernel_fidelity_swap_true(data, Xd, Yd, qnode):
+    K = np.zeros((len(Xd), len(Yd)))
+    for i, a in enumerate(Xd):
+        psi_a = data['states'][float(a)]
+        for j, b in enumerate(Yd):
+            psi_b = data['states'][float(b)]
+            Fij = float(np.clip(qnode(psi_a, psi_b), 0.0, 1.0))  # expval Z = F
+            K[i, j] = Fij
+    return K
+
+def kernel_per_site_swap_true(data, Xd, Yd, qnode, eps=1e-300):
+    F = kernel_fidelity_swap_true(data, Xd, Yd, qnode)
+    F = np.clip(F, eps, 1.0)
+    return F**(1.0 / data['N'])
+
+def center_train_kernel(K):
+    r = K.mean(axis=1, keepdims=True)
+    c = K.mean(axis=0, keepdims=True)
+    a = K.mean()
+    return K - r - c + a, r.ravel(), c.ravel(), float(a)
+
+def center_cross_kernel(Kx, r_train, c_train, a_mean):
+    mean_star = Kx.mean(axis=1, keepdims=True)
+    return Kx - mean_star - c_train.reshape(1, -1) + a_mean
+
+def svm_with_kernel(train_delta, train_y, test_delta, K_fn, data, C=1e6, center_kernels=True, **kwargs):
+    K_train = K_fn(data, train_delta, train_delta, **kwargs)
+    K_test  = K_fn(data, test_delta,  train_delta, **kwargs)
+    K_train = (K_train + K_train.T) / 2
+    if center_kernels:
+        Kc, rmean, cmean, amean = center_train_kernel(K_train)
+        Kx = center_cross_kernel(K_test, rmean, cmean, amean)
+    else:
+        Kc, Kx = K_train, K_test
+    model = SVC(kernel='precomputed', C=C)
+    model.fit(Kc, train_y)
+    d_test = model.decision_function(Kx)
+    return model, d_test
+
+def beautify_axes(ax, show_minor=True):
+    ax.grid(True, which='major', alpha=0.22, lw=LINEWIDTH_GRID)
+    if show_minor:
+        ax.minorticks_on()
+        ax.grid(True, which='minor', alpha=0.08, lw=LINEWIDTH_GRID*0.8)
+    for s in ("top","right","bottom","left"):
+        ax.spines[s].set_visible(False)
+
+def box_axes(ax, inset=0.006, lw=LINEWIDTH_BOX, zorder=-1):
+    rect = Rectangle((inset, inset), 1-2*inset, 1-2*inset,
+                     transform=ax.transAxes, fill=False, edgecolor="black",
+                     linewidth=lw, zorder=zorder, clip_on=False)
+    ax.add_patch(rect)
+
+def scale_decision(d, mode="tanh"):
+    if mode == "raw":  return d
+    if mode == "tanh": return np.tanh(d)
+    return d
+
+def run_comparison_pra_style(
+    N=12,
+    delta_c_ref=0.5,
+    left=(0.35, 0.45),
+    right=(0.55, 0.65),
+    n_per=24,
+    C=1e6,
+    use_swap_test=True,
+    center_kernels=True,
+    swap_shots=2000,
+    swap_seed=123,
+    scale_mode="tanh",
+    save_pdf=True,
+    fname="xxz_comparison"
+):
+    print(f"[XXZ] N={N} | Δ_c≈{delta_c_ref} | swap={use_swap_test} | center={center_kernels} | shots={swap_shots}")
+    grid = np.linspace(0.25, 0.75, 50)
+    train_L = np.linspace(left[0], left[1], n_per)
+    train_R = np.linspace(right[0], right[1], n_per)
+    train_delta = np.concatenate([train_L, train_R])
+    train_y = np.concatenate([np.full(n_per, -1), np.full(n_per, 1)])
+    all_deltas = np.unique(np.concatenate([grid, train_delta]))
+    data = make_xxz_data(N, all_deltas)
+    _, dF_ed = svm_with_kernel(train_delta, train_y, grid, kernel_fidelity_direct, data, C=C, center_kernels=center_kernels)
+    _, dL_ed = svm_with_kernel(train_delta, train_y, grid, kernel_per_site_direct, data, C=C, center_kernels=center_kernels)
+    if use_swap_test:
+        qnode = make_true_swap_qnode(N_sys=N, shots=swap_shots, seed=swap_seed)
+        swap_kwargs = {'qnode': qnode}
+        _, dF_sw = svm_with_kernel(train_delta, train_y, grid, kernel_fidelity_swap_true, data, C=C, center_kernels=center_kernels, **swap_kwargs)
+        _, dL_sw = svm_with_kernel(train_delta, train_y, grid, kernel_per_site_swap_true, data, C=C, center_kernels=center_kernels, **swap_kwargs)
+    dF_ed_p = scale_decision(dF_ed, scale_mode)
+    dL_ed_p = scale_decision(dL_ed, scale_mode)
+    if use_swap_test:
+        dF_sw_p = scale_decision(dF_sw, scale_mode)
+        dL_sw_p = scale_decision(dL_sw, scale_mode)
+    K_map_F = kernel_fidelity_direct(data, grid, grid)
+    K_map_L = kernel_per_site_direct(data, grid, grid)
+    vmin_F, vmax_F = 0.0, 1.0
+    finite_vals = K_map_L[np.isfinite(K_map_L)]
+    base_p = 2.0 if np.nanmax(finite_vals) > 0.995 else 5.0
+    vmin_L = float(np.percentile(finite_vals, base_p))
+    vmax_L = 1.0
+    fig = plt.figure(figsize=(7.2, 5.0))
+    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.32)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(grid, dF_ed_p, 'o', ms=MARKERSIZE, mfc=C_ED, mec='black', mew=0.9, linestyle='None', label='ED')
+    if use_swap_test:
+        ax1.plot(grid, dF_sw_p, '--', color=C_SWAP, lw=LINEWIDTH_MAIN, dashes=(8,4), label='SWAP (true)')
+    ax1.axhline(0, color='k', lw=1.1, alpha=0.8)
+    ax1.axvline(delta_c_ref, color='k', lw=1.1, ls=':', alpha=0.9)
+    ax1.set_xlim(0.25, 0.75)
+    ax1.set_ylabel('d(Δ)', fontweight='bold')
+    ax1.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
+    beautify_axes(ax1); box_axes(ax1)
+    ax1.legend(loc='lower right', frameon=True, framealpha=0.95, edgecolor='black', handlelength=1.6, labelspacing=0.3, borderpad=0.35)
+    ax2 = fig.add_subplot(gs[0, 1])
+    im2 = ax2.imshow(K_map_F, origin='lower', extent=(0.25, 0.75, 0.25, 0.75),
+                     aspect='auto', cmap=CMAP_F, vmin=vmin_F, vmax=vmax_F, interpolation='bilinear')
+    cs2 = ax2.contour(grid, grid, K_map_F, levels=8, colors='white', linewidths=0.55, alpha=0.7)
+    ax2.clabel(cs2, inline=True, fmt="%.2f", fontsize=7, colors='white')
+    ax2.set_ylabel("Δ'", fontweight='bold')
+    ax2.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
+    beautify_axes(ax2, show_minor=False); box_axes(ax2)
+    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar2.set_label(r'$K^{(F)}$', rotation=90, fontweight='bold')
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(grid, dL_ed_p, 'o', ms=MARKERSIZE, mfc=C_ED, mec='black', mew=0.9, linestyle='None')
+    if use_swap_test:
+        ax3.plot(grid, dL_sw_p, '--', color=C_SWAP, lw=LINEWIDTH_MAIN, dashes=(8,4))
+    ax3.axhline(0, color='k', lw=1.1, alpha=0.8)
+    ax3.axvline(delta_c_ref, color='k', lw=1.1, ls=':', alpha=0.9)
+    ax3.set_xlim(0.25, 0.75)
+    ax3.set_ylabel('d(Δ)', fontweight='bold')
+    ax3.set_xlabel('Δ', fontweight='bold')
+    beautify_axes(ax3); box_axes(ax3)
+    ax4 = fig.add_subplot(gs[1, 1])
+    im4 = ax4.imshow(K_map_L, origin='lower', extent=(0.25, 0.75, 0.25, 0.75),
+                     aspect='auto', cmap=CMAP_L, vmin=vmin_L, vmax=vmax_L, interpolation='bilinear')
+    cs4 = ax4.contour(grid, grid, K_map_L, levels=6, colors='white', linewidths=0.55, alpha=0.7)
+    ax4.clabel(cs4, inline=True, fmt="%.3f", fontsize=7, colors='white')
+    ax4.set_xlabel('Δ', fontweight='bold'); ax4.set_ylabel("Δ'", fontweight='bold')
+    beautify_axes(ax4, show_minor=False); box_axes(ax4)
+    cbar4 = plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+    cbar4.set_label(r'$K^{(\lambda)}$', rotation=90, fontweight='bold')
+    if save_pdf:
+        fig.savefig(f"{fname}.pdf", bbox_inches='tight')
+        print(f" Saved {fname}.pdf")
+    plt.show()
+    return fig
+
+if __name__ == '__main__':
+    run_comparison_pra_style(
+        N=12,
+        delta_c_ref=0.5,
+        left=(0.35, 0.45),
+        right=(0.55, 0.65),
+        n_per=24,
+        C=1e6,
+        use_swap_test=True,     
+        center_kernels=False,    
+        swap_shots=2000,        
+        swap_seed=123,
+        scale_mode="tanh",
+        save_pdf=True,
+        fname="xxz"
+    )

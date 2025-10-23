@@ -1,0 +1,102 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+FONTSIZE_LABEL = 15  
+FONTSIZE_TICKS = 15
+FONTSIZE_LEGEND = 13
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "axes.labelsize": FONTSIZE_LABEL,
+    "axes.labelweight": 800,  
+    "xtick.labelsize": FONTSIZE_TICKS,
+    "ytick.labelsize": FONTSIZE_TICKS,
+    "legend.fontsize": FONTSIZE_LEGEND,
+    "axes.linewidth": 2.5,  
+    "xtick.major.width": 1.8,  
+    "xtick.major.size": 6.0,
+    "ytick.major.width": 1.8,  
+    "ytick.major.size": 6.0,
+    "figure.dpi": 200,
+    "savefig.dpi": 600,
+})
+C_LEFT = "#1f5cab"
+C_RIGHT = "#e06c00"
+C_LINE = "#333333"
+
+def k_modes(N):
+    if N % 2: raise ValueError("N must be even")
+    return (2*np.arange(N//2)+1)*np.pi/N
+
+def theta_k(h, g, ks):
+    return 0.5*np.arctan2(g*np.sin(ks), (h - np.cos(ks)))
+
+def F_xy(h1, h2, g, N, ks=None):
+    ks = k_modes(N) if ks is None else ks
+    d = theta_k(h2, g, ks) - theta_k(h1, g, ks)
+    c = np.clip(np.abs(np.cos(d)), 1e-300, 1.0)
+    return float(np.exp(np.sum(np.log(c))))
+
+def xy_lambda_intersection(
+    N=1000, gamma=0.5, reps=(0.75, 1.35),
+    hmin=0.6, hmax=1.4, n=801,
+    vline_true=1.0,
+    figsize=(7.0, 3.2),
+    fname="xy_lambda_intersection_pra",
+    legend_loc=(0.02, 0.98)
+):
+    h = np.linspace(hmin, hmax, n)
+    hL, hR = reps
+    ks = k_modes(N)
+    lamL = np.array([F_xy(hL, x, gamma, N, ks)**(1.0/N) for x in h])
+    lamR = np.array([F_xy(hR, x, gamma, N, ks)**(1.0/N) for x in h])
+    yL = -np.log(np.clip(lamL, 1e-300, 1.0))
+    yR = -np.log(np.clip(lamR, 1e-300, 1.0))
+    # Intersection (linear interpolation)
+    d = yL - yR
+    sgn = np.sign(d)
+    idx = np.where(sgn[:-1]*sgn[1:] < 0)[0]
+    hc = None
+    if len(idx) > 0:
+        i = idx[0]
+        x0, x1 = h[i], h[i+1]
+        d0, d1 = d[i], d[i+1]
+        hc = x0 - d0*(x1-x0)/(d1-d0 + 1e-15)
+    # Figure
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(h, -yL, color=C_LEFT, lw=2.4, label=r"$-\log\lambda(h_L,h)$")
+    ax.plot(h, -yR, color=C_RIGHT, lw=2.4, label=r"$-\log\lambda(h_R,h)$")
+    if vline_true is not None:
+        ax.axvline(vline_true, color=C_LINE, lw=1.2, ls=":", alpha=0.9)
+    if hc is not None:
+        ax.axvline(hc, color=C_LINE, lw=1.4, ls="--")
+        ax.text(hc, ax.get_ylim()[1]*0.92, fr"$\tilde h_c\!\approx\!{hc:.4f}$",
+                ha="right", va="top", color=C_LINE)
+    ax.set_xlim(hmin, hmax)
+    ax.set_xlabel(r"$h$", weight=800)  # Thick x-label
+    ax.set_ylabel(r"$\log \lambda$", weight=800)  # Thick y-label
+    ax.legend(frameon=True, edgecolor=C_LINE, loc=legend_loc)
+    ax.grid(True, alpha=0.25)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(2.5)  
+        spine.set_color(C_LINE)
+    ax.tick_params(axis='x', which='major', labelsize=FONTSIZE_TICKS, labelcolor=C_LINE, width=1.8)
+    ax.tick_params(axis='y', which='major', labelsize=FONTSIZE_TICKS, labelcolor=C_LINE, width=1.8)
+    # Explicitly set tick label font weight to make them thick
+    for label in ax.get_xticklabels():
+        label.set_fontweight(800)
+    for label in ax.get_yticklabels():
+        label.set_fontweight(800)
+    plt.tight_layout()
+    fig.savefig(f"{fname}.pdf", bbox_inches="tight")
+    plt.show()
+    print(f"Saved {fname}.pdf")
+
+xy_lambda_intersection(
+        N=1000, gamma=0.5, reps=(0.75, 1.35),
+        hmin=0.6, hmax=1.4, n=801,
+        figsize=(7.0, 3.2),
+        fname="xy_intersection",
+        legend_loc=(0.02, 0.58)
+    )

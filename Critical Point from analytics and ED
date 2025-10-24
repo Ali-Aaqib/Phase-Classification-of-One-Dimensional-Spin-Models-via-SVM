@@ -1,0 +1,236 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from functools import reduce
+from scipy.sparse import kron, identity, csr_matrix
+from scipy.sparse.linalg import eigsh
+
+# ANALYTICAL BOGOLIUBOV FORMULA
+
+def analytic_bogoliubov_fidelity(N, gamma, delta, h_vals, e_shift):
+   
+    if abs(delta) > 1e-10:
+        raise ValueError("Bogoliubov formula only valid for delta=0 (XY model)")
+
+    ks = (2 * np.arange(N//2) + 1) * np.pi / N
+
+    fidelities = []
+
+    for h in h_vals:
+        h_next = h + e_shift
+
+        numerator_h = gamma * np.sin(ks)
+        denominator_h = h - np.cos(ks)
+        theta_h = 0.5 * np.arctan2(numerator_h, denominator_h)
+
+        numerator_h_next = gamma * np.sin(ks)
+        denominator_h_next = h_next - np.cos(ks)
+        theta_h_next = 0.5 * np.arctan2(numerator_h_next, denominator_h_next)
+
+        dtheta = theta_h_next - theta_h
+
+        cos_dtheta = np.cos(dtheta)
+        F = np.prod(cos_dtheta**2)
+
+        fidelities.append(F)
+
+    return np.array(fidelities)
+
+
+#  NUMERICAL EXACT DIAGONALIZATION
+
+paulis = {
+    'X': csr_matrix([[0, 1], [1, 0]], dtype=complex),
+    'Y': csr_matrix([[0, -1j], [1j, 0]], dtype=complex),
+    'Z': csr_matrix([[1, 0], [0, -1]], dtype=complex),
+    'I': identity(2, format='csr'),
+}
+
+def term_sparse(N, ops):
+    
+    mats = [paulis[ops.get(i, 'I')] for i in range(N)]
+    return reduce(lambda A, B: kron(A, B, format='csr'), mats)
+
+def build_static_hamiltonians(N, gamma, delta):
+  
+    dim = 2**N
+    H_int   = csr_matrix((dim, dim), dtype=complex)
+    H_field = csr_matrix((dim, dim), dtype=complex)
+
+    for i in range(N):
+        ip1 = (i+1)%N
+        if abs((1+gamma)/2) > 1e-12:
+            H_int -= (1+gamma)/2 * term_sparse(N, {i:'X', ip1:'X'})
+        if abs((1-gamma)/2) > 1e-12:
+            H_int -= (1-gamma)/2 * term_sparse(N, {i:'Y', ip1:'Y'})
+        if abs(delta) > 1e-12:
+            H_int -= delta * term_sparse(N, {i:'Z', ip1:'Z'})
+        H_field -= term_sparse(N, {i:'Z'})
+
+    return H_int, H_field
+
+def parity_basis(N, parity='even'):
+    
+    want_even = (parity=='even')
+    return [s for s in range(1<<N) if ((bin(s).count('1') & 1)==0) == want_even]
+
+def ground_state(H, v0=None):
+   
+    eps, vecs = eigsh(H, k=1, which='SA', tol=1e-12, maxiter=2000, v0=v0)
+    return vecs[:,0]
+
+def numerical_fidelity_and_magnetization(N, gamma, delta, h_vals, e_shift, parity='even'):
+  
+    H_int_full, H_field_full = build_static_hamiltonians(N, gamma, delta)
+    basis = parity_basis(N, parity)
+
+    H_int = H_int_full.tocsr()[basis,:][:,basis]
+    H_field = H_field_full.tocsr()[basis,:][:,basis]
+
+    fidelities = []
+    mags = []
+    psi0_prev = None
+
+    for h in h_vals:
+        H0 = H_int + h * H_field
+        psi0 = ground_state(H0, v0=psi0_prev)
+        psi0_prev = psi0
+
+        mz = np.vdot(psi0, (-H_field).dot(psi0)).real
+        mags.append(mz)
+
+        H1 = H_int + (h+e_shift) * H_field
+        psi1 = ground_state(H1)
+
+        fidelities.append(np.abs(np.vdot(psi0, psi1))**2)
+
+    return np.array(fidelities), np.array(mags)
+
+
+
+# PARAMETERS
+
+
+gamma = 0.07
+delta = 0.0
+h_vals = np.linspace(0.4, 1.1, 101)
+e_shift = 0.005
+PARITY = 'even'
+
+N_values = [14,16,18]
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, Orange, Green
+
+
+# COMPUTE ANALYTICAL FIDELITIES
+
+
+print("=" * 70)
+print("COMPUTING ANALYTICAL (BOGOLIUBOV) FIDELITIES")
+print("=" * 70)
+
+fidelities_analytical = {}
+for N in N_values:
+    fidelities_analytical[N] = analytic_bogoliubov_fidelity(N, gamma, delta, h_vals, e_shift)
+    print(f"✓ Analytical fidelity computed for N={N}")
+
+print()
+
+
+# COMPUTE NUMERICAL FIDELITIES
+
+
+print("=" * 70)
+print("COMPUTING NUMERICAL (ED) FIDELITIES")
+print("=" * 70)
+
+fidelities_numerical = {}
+for N in N_values:
+    fid_num, _ = numerical_fidelity_and_magnetization(N, gamma, delta, h_vals, e_shift, parity=PARITY)
+    fidelities_numerical[N] = fid_num
+    print(f"✓ Numerical fidelity computed for N={N}")
+
+print()
+
+
+# CREATE COMBINED PUBLICATION-QUALITY PLOT
+
+
+fig, ax = plt.subplots(figsize=(8.5, 6))  # 2-column paper width
+
+# Plot analytical (LINES) and numerical (DOTS) for each N value
+for i, N in enumerate(N_values):
+    # Analytical as solid lines (no label)
+    ax.plot(h_vals, fidelities_analytical[N],
+            color=colors[i],
+            linestyle='-',
+            linewidth=3.5,
+            alpha=0.85)
+
+    # Numerical as dots (every 10th point for clarity) 
+    ax.scatter(h_vals[::5], fidelities_numerical[N][::5],
+               color=colors[i],
+               s=120,
+               marker='o',
+               alpha=0.7,
+               edgecolors='black',
+               linewidth=1.5,
+               label=f'N={N}',
+               zorder=5)
+
+# Set thick axes
+ax.spines['left'].set_linewidth(2.5)
+ax.spines['bottom'].set_linewidth(2.5)
+ax.spines['right'].set_linewidth(2.5)
+ax.spines['top'].set_linewidth(2.5)
+
+# Configure axes
+ax.set_xlabel(r'$h$', fontsize=20, fontweight='bold')
+ax.set_ylabel(r'$F(h, h+\delta h)$', fontsize=20, fontweight='bold')
+ax.set_title(r'', fontsize=15, fontweight='bold', pad=15)
+
+# Thick tick marks
+ax.tick_params(which='major', length=8, width=2.0, labelsize=18)
+ax.tick_params(which='minor', length=4, width=1.5, labelsize=18)
+
+# Grid
+ax.grid(True, alpha=0.3, linewidth=1.0, linestyle=':')
+
+# Format y-axis to remove scientific notation offset
+ax.ticklabel_format(style='plain', axis='y', useOffset=False)
+from matplotlib.ticker import FormatStrFormatter
+ax.yaxis.set_major_formatter(FormatStrFormatter('%.4f'))
+
+# Legend placed outside plot area (2 columns)
+ax.legend(fontsize=12, loc='lower right', frameon=True,
+          fancybox=False, shadow=False, edgecolor='black',
+          framealpha=0.95, borderpad=1.0, ncol=1)
+
+plt.tight_layout()
+
+plt.savefig('fidelity_combined_N_comparison.pdf', dpi=300, bbox_inches='tight', facecolor='white')
+plt.savefig('fidelity_combined_N_comparison.png', dpi=300, bbox_inches='tight', facecolor='white')
+plt.show()
+
+print("=" * 70)
+print("COMBINED PLOT SAVED")
+print("=" * 70)
+print(" fidelity_combined_N_comparison.pdf")
+print(" fidelity_combined_N_comparison.png")
+print()
+
+# COMPARISON STATISTICS
+
+
+print("=" * 70)
+print("ANALYTICAL VS NUMERICAL COMPARISON")
+print("=" * 70)
+
+for N in N_values:
+    fidelity_diff = np.abs(fidelities_analytical[N] - fidelities_numerical[N])
+    print(f"\nN={N}:")
+    print(f"  Max difference:  {np.max(fidelity_diff):.2e}")
+    print(f"  Mean difference: {np.mean(fidelity_diff):.2e}")
+    print(f"  Std difference:  {np.std(fidelity_diff):.2e}")
+    print(f"  Analytical min:  {np.min(fidelities_analytical[N]):.6f}")
+    print(f"  Numerical min:   {np.min(fidelities_numerical[N]):.6f}")
+    print(f"  Analytical max:  {np.max(fidelities_analytical[N]):.6f}")
+    print(f"  Numerical max:   {np.max(fidelities_numerical[N]):.6f}")

@@ -1,0 +1,171 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.sparse import csr_matrix, identity, kron, lil_matrix
+from scipy.sparse.linalg import eigsh
+
+def pauli_csr():
+    X = csr_matrix([[0, 1], [1, 0]], dtype=np.complex128)
+    Y = csr_matrix([[0, -1j], [1j, 0]], dtype=np.complex128)
+    Z = csr_matrix([[1, 0], [0, -1]], dtype=np.complex128)
+    I = identity(2, format='csr', dtype=np.complex128)
+    return X, Y, Z, I
+
+def make_I_list(N):
+    I2 = identity(2, format='csr', dtype=np.complex128)
+    I_list = [identity(1, format='csr', dtype=np.complex128)]
+    for _ in range(N):
+        I_list.append(kron(I_list[-1], I2, format='csr'))
+    return I_list
+
+def embed_two_site_adjacent(N, i, O2, I_list):
+    left  = I_list[i]
+    right = I_list[N - (i + 2)]
+    return kron(kron(left, O2, format='csr'), right, format='csr')
+
+def term_sparse(N, ops_dict, I2):
+    mats = []
+    for s in range(N):
+        mats.append(ops_dict.get(s, I2))
+    out = mats[0]
+    for m in mats[1:]:
+        out = kron(out, m, format='csr')
+    return out
+
+def term_sparse_pair(N, i, j, A, B, I2):
+    return term_sparse(N, {i: A, j: B}, I2)
+
+def build_blocks_XY_ZZ_Z(N, gamma=0.0, pbc=True):
+    X, Y, Z, I2 = pauli_csr()
+    XX = kron(X, X, format='csr')
+    YY = kron(Y, Y, format='csr')
+    ZZ = kron(Z, Z, format='csr')
+    I_list = make_I_list(N)
+    H_XY = lil_matrix((2**N, 2**N), dtype=np.complex128)
+    H_ZZ = lil_matrix((2**N, 2**N), dtype=np.complex128)
+    H_Z  = lil_matrix((2**N, 2**N), dtype=np.complex128)
+    for i in range(N-1):
+        H_XY += - (1.0 + gamma) / 2.0 * embed_two_site_adjacent(N, i, XX, I_list)
+        H_XY += - (1.0 - gamma) / 2.0 * embed_two_site_adjacent(N, i, YY, I_list)
+        H_ZZ += - 1.0 * embed_two_site_adjacent(N, i, ZZ, I_list)
+    if pbc and N >= 2:
+        H_XY += - (1.0 + gamma) / 2.0 * term_sparse_pair(N, N-1, 0, X, X, I2)
+        H_XY += - (1.0 - gamma) / 2.0 * term_sparse_pair(N, N-1, 0, Y, Y, I2)
+        H_ZZ += - 1.0 * term_sparse_pair(N, N-1, 0, Z, Z, I2)
+    for i in range(N):
+        H_Z += - term_sparse(N, {i: Z}, I2)
+    return H_XY.tocsr(), H_ZZ.tocsr(), H_Z.tocsr()
+
+def ground_state_eigsh(H, v0=None, tol=1e-10, maxiter=None, ncv=None):
+    w, V = eigsh(H, k=1, which='SA', v0=v0, tol=tol, maxiter=maxiter, ncv=ncv)
+    psi = V[:, 0]
+    psi = psi / np.linalg.norm(psi)
+    return float(w[0]), psi
+
+def scan_delta_xxz_csr(N=12, gamma=0.0, h=0.0, deltas=None, dDelta=0.01, warmstart=True):
+    if deltas is None:
+        deltas = np.concatenate([
+            np.linspace(0, 0.4, 35),
+            np.linspace(0.4, 1, 35)
+        ])
+    H_XY, H_ZZ, H_Z = build_blocks_XY_ZZ_Z(N, gamma=gamma, pbc=True)
+    F_list = []
+    psi_prev = None
+    for Delta in deltas:
+        H  = H_XY + Delta * H_ZZ + h * H_Z
+        E, psi = ground_state_eigsh(H, v0=psi_prev if (warmstart and psi_prev is not None) else None)
+        Hp = H_XY + (Delta + dDelta) * H_ZZ + h * H_Z
+        Ep, psip = ground_state_eigsh(Hp, v0=psi)
+        F = float(np.abs(np.vdot(psi, psip))**2)
+        F_list.append(F)
+        psi_prev = psi
+    return deltas, np.array(F_list)
+
+# ========================= MAIN COMPUTATION =========================
+if __name__ == "__main__":
+    # Parameters
+    N_values = [14,16,18]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, Orange, Green
+    gamma = 0.0
+    h_fixed = 0.0
+    dDelta = 0.005
+
+    print("=" * 70)
+    print("COMPUTING XXZ FIDELITIES")
+    print("=" * 70)
+
+    # Store results
+    results = {}
+    for N in N_values:
+        deltas, F_loc = scan_delta_xxz_csr(
+            N=N, gamma=gamma, h=h_fixed, deltas=None, dDelta=dDelta, warmstart=True
+        )
+        results[N] = (deltas, F_loc)
+        print(f" Fidelity computed for N={N}")
+
+    print()
+
+    fig, ax = plt.subplots(figsize=(8.5, 6))  # 2-column paper width
+
+    for i, N in enumerate(N_values):
+        deltas, F_loc = results[N]
+
+        ax.scatter(deltas, F_loc,
+                   color=colors[i],
+                   s=120,
+                   marker='o',
+                   alpha=0.7,
+                   edgecolors='black',
+                   linewidth=1.5,
+                   label=f'N={N}',
+                   zorder=5)
+
+    # Set thick axes
+    ax.spines['left'].set_linewidth(2.5)
+    ax.spines['bottom'].set_linewidth(2.5)
+    ax.spines['right'].set_linewidth(2.5)
+    ax.spines['top'].set_linewidth(2.5)
+
+    # Configure axes
+    ax.set_xlabel(r' $\Delta$', fontsize=20, fontweight='bold')
+    ax.set_ylabel(r'$F(\Delta, \Delta+\delta\Delta)$', fontsize=20, fontweight='bold')
+    ax.set_title(r'',
+                 fontsize=15, fontweight='bold', pad=15)
+
+    # Thick tick marks
+    ax.tick_params(which='major', length=8, width=2.0, labelsize=16)
+    ax.tick_params(which='minor', length=4, width=1.5, labelsize=16)
+
+    # Grid
+    ax.grid(True, alpha=0.3, linewidth=1.0, linestyle=':')
+
+    # Legend placed outside plot area
+    # ax.legend(fontsize=12, loc='upper left', frameon=True,
+    #           fancybox=False, shadow=False, edgecolor='black',
+    #           framealpha=0.95, borderpad=1.0, ncol=1,
+    #           bbox_to_anchor=(0.02, 0.98))
+
+    plt.tight_layout()
+
+    plt.savefig('fidelity_xxz_N_comparison.pdf', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig('fidelity_xxz_N_comparison.png', dpi=300, bbox_inches='tight', facecolor='white')
+    plt.show()
+
+    print("=" * 70)
+    print("XXZ PLOT SAVED")
+    print("=" * 70)
+    print(" fidelity_xxz_N_comparison.pdf")
+    print(" fidelity_xxz_N_comparison.png")
+    print()
+
+    # ========================= STATISTICS =========================
+    print("=" * 70)
+    print("FIDELITY STATISTICS")
+    print("=" * 70)
+
+    for N in N_values:
+        deltas, F_loc = results[N]
+        print(f"\nN={N}:")
+        print(f"  Min fidelity:  {np.min(F_loc):.6f} at Δ={deltas[np.argmin(F_loc)]:.3f}")
+        print(f"  Max fidelity:  {np.max(F_loc):.6f} at Δ={deltas[np.argmax(F_loc)]:.3f}")
+        print(f"  Mean fidelity: {np.mean(F_loc):.6f}")
+        print(f"  Std fidelity:  {np.std(F_loc):.6f}")

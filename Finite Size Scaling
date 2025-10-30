@@ -1,0 +1,291 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.svm import SVC
+from scipy.optimize import curve_fit
+from scipy.interpolate import PchipInterpolator
+from functools import lru_cache
+from time import perf_counter
+
+GAMMA = 0.5
+N_LIST = np.array([20, 30, 40, 50, 60, 80, 100, 150, 200, 300, 500, 800, 1200], dtype=int)
+
+H_GRID = np.linspace(0.25, 1.75, 1001)
+H_REF  = 1.75
+C_HARD = 1e6
+RNG_SEED = 42
+
+DELTA1 = (0.85, 0.90, 1.10, 1.15)
+DELTA2 = (0.60, 0.70, 1.60, 1.70)
+M_PER_SIDE = 8
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "axes.labelsize": 14,
+    "axes.labelweight": "bold",
+    "axes.titlesize": 13,
+    "axes.titleweight": "bold",
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 10,
+    "axes.linewidth": 2.5,
+    "lines.linewidth": 2.5,
+    "lines.markersize": 8,
+    "figure.dpi": 150,
+})
+
+@lru_cache(maxsize=None)
+def apbc_modes(N: int):
+    if N % 2:
+        raise ValueError("Use even N for APBC mode set.")
+    return np.pi * (2*np.arange(1, N//2 + 1) - 1) / N
+
+def bogoliubov_angle(h_vals, ks, gamma):
+    h_vals = np.atleast_1d(h_vals); ks = np.atleast_1d(ks)
+    num = gamma * np.sin(ks)[None, :]
+    den = h_vals[:, None] - np.cos(ks)[None, :]
+    return 0.5 * np.arctan2(num, den)
+
+def fidelity_kernel(h_list, N, gamma):
+    ks = apbc_modes(N)
+    H = np.asarray(h_list); T = bogoliubov_angle(H, ks, gamma)
+    M = len(H); K = np.empty((M, M), float)
+    for i in range(M):
+        dth = T - T[i]
+        c = np.clip(np.abs(np.cos(dth)), 1e-300, 1.0)
+        K[i, :] = np.exp(np.sum(np.log(c), axis=1))
+    K = 0.5*(K + K.T); np.fill_diagonal(K, 1.0)
+    return K
+
+def per_site_kernel(h_list, N, gamma):
+    KF = fidelity_kernel(h_list, N, gamma)
+    return np.power(np.clip(KF, 1e-300, 1.0), 1.0/N)
+
+def cross_kernel(h_test, h_train, N, gamma, per_site=False):
+    ks = apbc_modes(N)
+    Tt = bogoliubov_angle(np.atleast_1d(h_test), ks, gamma)
+    Tr = bogoliubov_angle(np.atleast_1d(h_train), ks, gamma)
+    d = Tr[None, :, :] - Tt[:, None, :]
+    c = np.clip(np.abs(np.cos(d)), 1e-300, 1.0)
+    F = np.exp(np.sum(np.log(c), axis=2))
+    return np.power(F, 1.0/N) if per_site else F
+
+def svm_critical_point(h_train, y_train, N, gamma, h_test, use_lambda=False, C=C_HARD):
+    K_train = per_site_kernel(h_train, N, gamma) if use_lambda else fidelity_kernel(h_train, N, gamma)
+    K_test  = cross_kernel(h_test, h_train, N, gamma, per_site=use_lambda)
+    clf = SVC(kernel='precomputed', C=C).fit(K_train, y_train)
+    d = clf.decision_function(K_test)
+    s = np.sign(d); idx = np.where(np.diff(s) != 0)[0]
+    if idx.size:
+        i = idx[0]; x0, x1 = h_test[i], h_test[i+1]; y0, y1 = d[i], d[i+1]
+        return float(x0 - y0*(x1 - x0)/(y1 - y0))
+    j = int(np.argmin(np.abs(d))); j0 = max(0, j-2); j1 = min(len(h_test), j+3)
+    x = h_test[j0:j1]; y = d[j0:j1]
+    if len(x) >= 3:
+        A = np.vstack([x**2, x, np.ones_like(x)]).T
+        a, b, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        if a != 0:
+            x_star = -b/(2*a)
+            if x.min() <= x_star <= x.max():
+                return float(x_star)
+    return float(h_test[j])
+
+def benchmark_from_dloglambda(N, gamma, h_grid, h_ref=H_REF):
+    ks = apbc_modes(N)
+    Ta = bogoliubov_angle(h_grid, ks, gamma)
+    Tb = bogoliubov_angle(np.array([h_ref]), ks, gamma)
+    dth = Tb - Ta
+    c = np.clip(np.abs(np.cos(dth)), 1e-300, 1.0)
+    logF = np.sum(np.log(c), axis=1)
+    loglam = logF / N
+    dlog = np.gradient(loglam, h_grid)
+    return float(h_grid[np.argmax(np.abs(dlog))])
+
+def critical_from_intersection(N, gamma, hL, hR, h_grid):
+    ks = apbc_modes(N)
+    T  = bogoliubov_angle(h_grid, ks, gamma)
+    TL = bogoliubov_angle(np.array([hL]), ks, gamma)
+    TR = bogoliubov_angle(np.array([hR]), ks, gamma)
+    dL = TL - T; dR = TR - T
+    cL = np.clip(np.abs(np.cos(dL)), 1e-300, 1.0)
+    cR = np.clip(np.abs(np.cos(dR)), 1e-300, 1.0)
+    g = (np.sum(np.log(cL), axis=1) - np.sum(np.log(cR), axis=1)) / N
+    s = np.sign(g); idx = np.where(np.diff(s) != 0)[0]
+    if idx.size:
+        i = idx[0]; x0, x1 = h_grid[i], h_grid[i+1]; y0, y1 = g[i], g[i+1]
+        return float(x0 - y0*(x1 - x0)/(y1 - y0))
+    j = int(np.argmin(np.abs(g))); return float(h_grid[j])
+
+def make_training_set(kind):
+    if kind == "random":
+        rng = np.random.default_rng(RNG_SEED)
+        h = np.sort(rng.uniform(H_GRID.min(), H_GRID.max(), 16))
+        y = np.where(h < 1.0, -1, +1)
+        return h, y
+    elif kind == "delta1":
+        L = np.linspace(DELTA1[0], DELTA1[1], M_PER_SIDE)
+        R = np.linspace(DELTA1[2], DELTA1[3], M_PER_SIDE)
+        h = np.concatenate([L, R]); y = np.array([-1]*M_PER_SIDE + [1]*M_PER_SIDE)
+        return h, y
+    elif kind == "delta2":
+        L = np.linspace(DELTA2[0], DELTA2[1], M_PER_SIDE)
+        R = np.linspace(DELTA2[2], DELTA2[3], M_PER_SIDE)
+        h = np.concatenate([L, R]); y = np.array([-1]*M_PER_SIDE + [1]*M_PER_SIDE)
+        return h, y
+    else:
+        raise ValueError("kind must be one of: random, delta1, delta2")
+
+def sweep_all(gamma=GAMMA):
+    results = {'F':{'benchmark':[], 'random':[], 'delta1':[], 'delta2':[]},
+               'lambda':{'benchmark':[], 'random':[], 'delta1':[], 'delta2':[]},
+               'xsect':{'delta1':[], 'delta2':[]}}
+    print(f"Running XY (gamma={gamma}) with SMALL/FAR training…")
+    for N in N_LIST:
+        t0 = perf_counter()
+        hc_b = benchmark_from_dloglambda(N, gamma, H_GRID, H_REF)
+        results['F']['benchmark'].append(hc_b); results['lambda']['benchmark'].append(hc_b)
+
+        hL_d1 = 0.5*(DELTA1[0]+DELTA1[1]); hR_d1 = 0.5*(DELTA1[2]+DELTA1[3])
+        hL_d2 = 0.5*(DELTA2[0]+DELTA2[1]); hR_d2 = 0.5*(DELTA2[2]+DELTA2[3])
+
+        htr, ytr = make_training_set('delta2')
+        t1 = perf_counter()
+        hcF_d2 = svm_critical_point(htr, ytr, N, gamma, H_GRID, use_lambda=False)
+        t2 = perf_counter()
+        hcL_d2 = svm_critical_point(htr, ytr, N, gamma, H_GRID, use_lambda=True)
+        t3 = perf_counter()
+        hcI_d2 = critical_from_intersection(N, gamma, hL_d2, hR_d2, H_GRID)
+
+        htr, ytr = make_training_set('delta1')
+        hcF_d1 = svm_critical_point(htr, ytr, N, gamma, H_GRID, use_lambda=False)
+        hcL_d1 = svm_critical_point(htr, ytr, N, gamma, H_GRID, use_lambda=True)
+        hcI_d1 = critical_from_intersection(N, gamma, hL_d1, hR_d1, H_GRID)
+
+        htr, ytr = make_training_set('random')
+        hcF_r  = svm_critical_point(htr, ytr, N, gamma, H_GRID, use_lambda=False)
+        hcL_r  = svm_critical_point(htr, ytr, N, gamma, H_GRID, use_lambda=True)
+
+        results['F']['delta2'].append(hcF_d2);      results['lambda']['delta2'].append(hcL_d2)
+        results['F']['delta1'].append(hcF_d1);      results['lambda']['delta1'].append(hcL_d1)
+        results['F']['random'].append(hcF_r);       results['lambda']['random'].append(hcL_r)
+        results['xsect']['delta2'].append(hcI_d2);  results['xsect']['delta1'].append(hcI_d1)
+
+        print(f"  N={N:<4d} total={perf_counter()-t0:5.2f}s  δ2(F,λ)=({t2-t1:4.2f},{t3-t2:4.2f})s")
+
+    for k in results:
+        for m in results[k]:
+            results[k][m] = np.array(results[k][m], float)
+    return results
+
+def draw_pchip(ax, x, y, color, ls='--', lw=3.0, z=0):
+    idx = np.argsort(x); xs, ys = x[idx], y[idx]
+    if len(xs) >= 2:
+        spl = PchipInterpolator(xs, ys)
+        xf = np.logspace(np.log10(xs.min()), np.log10(xs.max()), 400)
+        ax.semilogx(xf, spl(xf), ls, color=color, lw=lw, zorder=z)
+
+def tail_converges_to_one(y, x, last_k=5, tol=0.02):
+    if len(y) < last_k: return False
+    tail_y = y[-last_k:]; tail_x = x[-last_k:]
+    near = np.all(np.abs(tail_y - 1.0) <= tol)
+    dist = np.abs(tail_y - 1.0)
+    trend = np.all(dist[1:] <= dist[:-1] + 1e-6)
+    return bool(near and trend)
+
+def safe_power_fit(ax, x, y, color, ls, label=None,
+                   mask_minN=100, rmse_max=5e-3, hc_inf_tol=0.02):
+    mask = x >= mask_minN
+    xfit = x[mask]; yfit = y[mask]
+    if xfit.size < 3:
+        draw_pchip(ax, x, y, color, ls=ls, lw=3.0); return
+    try:
+        p0 = [1.0, 0.1, 1.0]
+        bounds = ([1.0 - hc_inf_tol, -1.0, 0.5], [1.0 + hc_inf_tol, 1.0, 2.0])
+        popt, _ = curve_fit(lambda N,hc_inf,a,nu: hc_inf + a*N**(-1.0/nu),
+                            xfit, yfit, p0=p0, bounds=bounds, maxfev=10000)
+        ypred = popt[0] + popt[1]*xfit**(-1.0/popt[2])
+        rmse = np.sqrt(np.mean((ypred - yfit)**2))
+        if rmse > rmse_max:
+            draw_pchip(ax, x, y, color, ls=ls, lw=3.0); return
+        Nfine = np.logspace(np.log10(x.min()), np.log10(5000), 250)
+        ax.semilogx(Nfine, popt[0] + popt[1]*Nfine**(-1.0/popt[2]), ls, color=color, lw=3.0,
+                    label=(label if label else None))
+    except Exception:
+        draw_pchip(ax, x, y, color, ls=ls, lw=3.0)
+
+def plot_hc_scaling(results, gamma=GAMMA):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.5, 9.0))
+    colors  = {'benchmark':'k', 'random':'#e69f00', 'delta1':'#d55e00', 'delta2':'#0072b2'}
+    markers = {'benchmark':'x', 'random':'o', 'delta1':'s', 'delta2':'^'}
+    labels  = {'benchmark':'benchmark', 'random':'random', 'delta1':r'$\delta_1$', 'delta2':r'$\delta_2$'}
+    for method in ['benchmark', 'delta2', 'delta1', 'random']:
+        y = results['F'][method]
+        ax1.semilogx(N_LIST, y, markers[method], color=colors[method],
+                     markersize=9, markeredgewidth=2.5,
+                     markerfacecolor='none' if method=='benchmark' else colors[method],
+                     label=labels[method], linewidth=2.5)
+        if tail_converges_to_one(y, N_LIST, last_k=5, tol=0.02):
+            draw_pchip(ax1, N_LIST, y, color=colors[method], ls='--', lw=3.0, z=0)
+    ax1.axhline(1.0, color='gray', ls=':', lw=2.5, alpha=0.6)
+    ax1.set_xlabel('N', fontweight='bold', fontsize=14)
+    ax1.set_ylabel(r'$h_c(N)$', fontweight='bold', fontsize=14)
+    ax1.set_ylim(0.85, 1.15)
+    ax1.grid(alpha=0.3, linewidth=1.5)
+    ax1.legend(loc='best', fontsize=11, frameon=True, framealpha=0.95, edgecolor='black', fancybox=False)
+    ax1.tick_params(width=2.0, length=6)
+    for method in ['benchmark', 'delta2', 'delta1', 'random']:
+        ax2.semilogx(N_LIST, results['lambda'][method], markers[method], color=colors[method],
+                     markersize=9, markeredgewidth=2.5,
+                     markerfacecolor='none' if method=='benchmark' else colors[method],
+                     linewidth=2.5)
+    safe_power_fit(ax2, N_LIST, results['lambda']['benchmark'], colors['benchmark'], '--')
+    safe_power_fit(ax2, N_LIST, results['lambda']['delta2'], colors['delta2'], '--')
+    safe_power_fit(ax2, N_LIST, results['lambda']['delta1'], colors['delta1'], '-.')
+    safe_power_fit(ax2, N_LIST, results['lambda']['random'],  colors['random'],  ':')
+    ax2.axhline(1.0, color='gray', ls=':', lw=2.5, alpha=0.6)
+    ax2.set_xlabel('N', fontweight='bold', fontsize=14)
+    ax2.set_ylabel(r'$h_c(N)$', fontweight='bold', fontsize=14)
+    ax2.set_ylim(0.85, 1.15)
+    ax2.grid(alpha=0.3, linewidth=1.5)
+    ax2.tick_params(width=2.0, length=6)
+    plt.tight_layout()
+    return fig
+
+def fit_nu(N, hc_vals, hc_inf_window=(0.98, 1.02)):
+    N = np.asarray(N, float)
+    y = np.asarray(hc_vals, float)
+    def model(N, hc_inf, a, nu):
+        return hc_inf + a * N**(-1.0/nu)
+    p0 = [1.0, 0.1, 1.0]
+    bounds = ([hc_inf_window[0], -np.inf, 0.3],
+              [hc_inf_window[1],  np.inf,  2.0])
+    popt, pcov = curve_fit(model, N, y, p0=p0, bounds=bounds, maxfev=20000)
+    perr = np.sqrt(np.diag(pcov))
+    hc_inf, a, nu = popt
+    sigma_hc_inf, sigma_a, sigma_nu = perr
+    return (hc_inf, a, nu, (sigma_hc_inf, sigma_a, sigma_nu))
+
+if __name__ == "__main__":
+    print(f"Starting finite-size scaling with XY analytics (gamma={GAMMA})")
+    results = sweep_all(gamma=GAMMA)
+    fig = plot_hc_scaling(results, gamma=GAMMA)
+    fig.savefig("FS.pdf", bbox_inches='tight')
+    plt.show()
+
+    print("\n=== Finite-size scaling fit for nu (from h_c(N)) ===")
+    report_lines = []
+    for method in ['benchmark','delta2','delta1','random']:
+        try:
+            hc_vals = results['lambda'][method]
+            hc_inf, a, nu, errs = fit_nu(N_LIST, hc_vals)
+            line = (f"[nu-fit] method={method:<9s}  "
+                    f"hc_inf={hc_inf:.6f} ±{errs[0]:.6f}   "
+                    f"nu={nu:.3f} ±{errs[2]:.3f}   "
+                    f"a={a:.3e} ±{errs[1]:.3e}")
+            print(line); report_lines.append(line)
+        except Exception as e:
+            line = f"[nu-fit] method={method:<9s}  FAILED: {e}"
+            print(line); report_lines.append(line)
+
+    with open("FS_exponent_fits.txt", "w") as f:
+        f.write("\n".join(report_lines) + "\n")
+    print('\nSaved: FS_exponent_fits.txt')
